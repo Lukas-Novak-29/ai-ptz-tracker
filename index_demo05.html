@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Ptz Tracker s Online Učením — Beta verze</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #222; color: #eee; margin: 0; padding: 10px; }
+  #container { max-width: 960px; margin: auto; }
+  canvas { background: #000; display: block; margin: 10px 0; }
+  video { display: none; }
+  button, select, input[type=range] { margin: 5px 3px; }
+  #referencePreview img { max-height: 100px; }
+  .class-label { display: inline-block; background: #444; padding: 3px 8px; margin: 0 4px 4px 0; border-radius: 4px; cursor: pointer; user-select: none; }
+  .class-label.selected { background: #ff6; color: #000; }
+</style>
+</head>
+<body>
+
+<div id="container">
+  <h1>AI Ptz Tracker s Online Učením — <em>Beta verze</em></h1>
+
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="canvas"></canvas>
+
+  <div>
+    <button id="switchCameraBtn">Přepnout kameru</button>
+    <select id="videoQualitySelect">
+      <option value="">Výchozí kvalita</option>
+      <option value="qvga">QVGA (320x240)</option>
+      <option value="hd">HD (1280x720)</option>
+      <option value="fhd">Full HD (1920x1080)</option>
+    </select>
+  </div>
+
+  <div>
+    <button id="prevBtn">Předchozí objekt</button>
+    <button id="nextBtn">Další objekt</button>
+    <button id="toggleZoomBtn">Zoom režim: automatický</button>
+  </div>
+
+  <div>
+    <label>Manuální zoom: <span id="manualZoomValue">1.0</span></label><br />
+    <input type="range" id="manualZoomSlider" min="1" max="5" step="0.1" value="1" />
+  </div>
+
+  <div>
+    <label>Škála zoom boxu: <span id="zoomBoxScaleValue">1.5</span></label><br />
+    <input type="range" id="zoomBoxScaleSlider" min="1" max="3" step="0.1" value="1.5" />
+  </div>
+
+  <div>
+    <label>Rychlost adaptivního zoomu: <span id="adaptiveSpeedValue">0.2</span></label><br />
+    <input type="range" id="adaptiveSpeedSlider" min="0.01" max="1" step="0.01" value="0.2" />
+  </div>
+
+  <hr />
+
+  <div>
+    <button id="loadReferenceBtn">Načíst referenční fotku</button>
+    <input type="file" id="referenceImageInput" accept="image/*" style="display:none" />
+    <button id="clearReferenceBtn">Vymazat referenci</button>
+  </div>
+  <div id="referencePreview"></div>
+
+  <hr />
+
+  <div>
+    <button id="startRecBtn">Začít nahrávání</button>
+    <button id="stopRecBtn" disabled>Zastavit nahrávání</button>
+    <button id="exportMp4Btn" disabled>Exportovat MP4</button>
+  </div>
+
+  <hr />
+
+  <div>
+    <strong>Online učení:</strong>
+    <div id="classButtons"></div>
+    <input type="text" id="newClassName" placeholder="Nová třída..." />
+    <button id="addClassBtn">Přidat třídu</button>
+  </div>
+
+  <hr />
+
+  <div id="info">Info: čekám na start...</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.12.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.0/dist/mobilenet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/knn-classifier@1.2.2/dist/knn-classifier.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.5/dist/ffmpeg.min.js"></script>
+
+<script>
+(async () => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const prevBtn = document.getElementById('prevBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const toggleZoomBtn = document.getElementById('toggleZoomBtn');
+  const switchCameraBtn = document.getElementById('switchCameraBtn');
+  const videoQualitySelect = document.getElementById('videoQualitySelect');
+
+  const manualZoomSlider = document.getElementById('manualZoomSlider');
+  const manualZoomValue = document.getElementById('manualZoomValue');
+  const zoomBoxScaleSlider = document.getElementById('zoomBoxScaleSlider');
+  const zoomBoxScaleValue = document.getElementById('zoomBoxScaleValue');
+  const adaptiveSpeedSlider = document.getElementById('adaptiveSpeedSlider');
+  const adaptiveSpeedValue = document.getElementById('adaptiveSpeedValue');
+
+  const loadReferenceBtn = document.getElementById('loadReferenceBtn');
+  const clearReferenceBtn = document.getElementById('clearReferenceBtn');
+  const referenceImageInput = document.getElementById('referenceImageInput');
+  const referencePreview = document.getElementById('referencePreview');
+
+  const startRecBtn = document.getElementById('startRecBtn');
+  const stopRecBtn = document.getElementById('stopRecBtn');
+  const exportMp4Btn = document.getElementById('exportMp4Btn');
+
+  const classButtonsDiv = document.getElementById('classButtons');
+  const newClassNameInput = document.getElementById('newClassName');
+  const addClassBtn = document.getElementById('addClassBtn');
+
+  const infoDiv = document.getElementById('info');
+
+  let videoStream = null;
+  let usingFrontCamera = true;
+
+  let model = null;       // coco-ssd model
+  let mobileNetModel = null; // mobilenet feature extractor
+  const classifier = knnClassifier.create(); // KNN classifier pro online learning
+
+  let predictions = [];
+  let selectedIndex = -1;
+
+  let zoomModes = ['automatický', 'adaptivní', 'manuální'];
+  let zoomModeIndex = 0;
+  let zoomMode = zoomModes[zoomModeIndex];
+
+  let manualZoom = 1;
+  let zoomBoxScale = 1.5;
+  let adaptiveSpeed = 0.2;
+  let smoothedZoom = 1;
+
+  let mediaRecorder = null;
+  let recordedChunks = [];
+
+  let referenceEmbedding = null;
+
+  function updateInfo(msg) {
+    infoDiv.textContent = 'Info: ' + msg;
+    console.log('Info:', msg); // Také vypisuje do konzole pro lepší debugging
+  }
+
+  async function setupCamera() {
+    updateInfo("Pokouším se o přístup ke kameře...");
+    if (videoStream) {
+      updateInfo("Zastavuji starý videostream.");
+      videoStream.getTracks().forEach(t => t.stop());
+      videoStream = null;
+    }
+
+    let constraints = {
+      audio: false,
+      video: {
+        facingMode: usingFrontCamera ? "user" : "environment"
+      }
+    };
+
+    switch (videoQualitySelect.value) {
+      case "qvga":
+        constraints.video.width = { ideal: 320 };
+        constraints.video.height = { ideal: 240 };
+        break;
+      case "hd":
+        constraints.video.width = { ideal: 1280 };
+        constraints.video.height = { ideal: 720 };
+        break;
+      case "fhd":
+        constraints.video.width = { ideal: 1920 };
+        constraints.video.height = { ideal: 1080 };
+        break;
+    }
+
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = videoStream;
+
+      updateInfo("Video stream získán. Čekám na spuštění přehrávání...");
+      await new Promise(resolve => {
+        video.addEventListener('playing', () => {
+          resolve();
+        }, { once: true });
+      });
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      updateInfo(`Kamera spuštěna: ${usingFrontCamera ? 'přední' : 'zadní'}, rozlišení: ${canvas.width}×${canvas.height}`);
+      
+    } catch (e) {
+      updateInfo("Chyba při přístupu ke kameře: " + e.message);
+      alert("Nelze získat přístup ke kameře: " + e.message);
+    }
+  }
+
+  async function loadModels() {
+    updateInfo("Načítám COCO-SSD model pro detekci objektů...");
+    model = await cocoSsd.load();
+    updateInfo("Načítám MobileNet model pro extrakci rysů...");
+    mobileNetModel = await mobilenet.load();
+    updateInfo("Modely načteny. Aplikace je připravena.");
+  }
+
+  function drawBoundingBoxes(detections) {
+    if (!detections.length) return;
+    detections.forEach((det, i) => {
+      const {bbox, class: className, score} = det;
+      const [x, y, w, h] = bbox;
+      ctx.lineWidth = (i === selectedIndex) ? 4 : 2;
+      ctx.strokeStyle = (i === selectedIndex) ? '#ff0' : '#0f0';
+      ctx.fillStyle = (i === selectedIndex) ? 'rgba(255,255,0,0.2)' : 'rgba(0,255,0,0.2)';
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillRect(x, y, w, h);
+      ctx.font = "18px Arial";
+      ctx.fillStyle = '#000';
+      ctx.fillText(`${className} ${(score*100).toFixed(1)}%`, x + 4, y + 20);
+    });
+  }
+
+  function zoomToBox(box) {
+    if (!box) return;
+    let [x, y, w, h] = box;
+    let cx = x + w/2;
+    let cy = y + h/2;
+    let scale = zoomBoxScale;
+    let zoomedWidth = canvas.width / scale;
+    let zoomedHeight = canvas.height / scale;
+    let sx = Math.max(0, cx - zoomedWidth / 2);
+    let sy = Math.max(0, cy - zoomedHeight / 2);
+    if (sx + zoomedWidth > canvas.width) sx = canvas.width - zoomedWidth;
+    if (sy + zoomedHeight > canvas.height) sy = canvas.height - zoomedHeight;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, sx, sy, zoomedWidth, zoomedHeight, 0, 0, canvas.width, canvas.height);
+  }
+
+  function adaptiveZoom(currentZoom, targetZoom, speed) {
+    return currentZoom + (targetZoom - currentZoom) * speed;
+  }
+
+  function toggleZoomMode() {
+    zoomModeIndex = (zoomModeIndex + 1) % zoomModes.length;
+    zoomMode = zoomModes[zoomModeIndex];
+    toggleZoomBtn.textContent = `Zoom režim: ${zoomMode}`;
+    updateInfo(`Zoom režim přepnut na: ${zoomMode}`);
+  }
+
+  function selectNextObject() {
+    if (predictions.length === 0) {
+      selectedIndex = -1;
+      updateInfo("Žádné objekty k výběru.");
+      return;
+    }
+    selectedIndex = (selectedIndex + 1) % predictions.length;
+    updateInfo(`Vybrán objekt číslo: ${selectedIndex + 1}`);
+  }
+
+  function selectPrevObject() {
+    if (predictions.length === 0) {
+      selectedIndex = -1;
+      updateInfo("Žádné objekty k výběru.");
+      return;
+    }
+    selectedIndex = (selectedIndex - 1 + predictions.length) % predictions.length;
+    updateInfo(`Vybrán objekt číslo: ${selectedIndex + 1}`);
+  }
+
+  async function addExample(classId) {
+    if (selectedIndex < 0 || selectedIndex >= predictions.length) {
+      updateInfo("Nejprve vyberte detekovaný objekt, který chcete přiřadit k třídě.");
+      return;
+    }
+    updateInfo(`Přidávám vzorek pro třídu "${classId}"...`);
+    const box = predictions[selectedIndex].bbox;
+    const [x, y, w, h] = box;
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = w;
+    tempCanvas.height = h;
+    const tempCtx = tempCanvas.getContext('2d');
+    tempCtx.drawImage(video, x, y, w, h, 0, 0, w, h);
+    const imgTensor = tf.browser.fromPixels(tempCanvas);
+    const embedding = mobileNetModel.infer(imgTensor, true);
+    classifier.addExample(embedding, classId);
+    imgTensor.dispose();
+    embedding.dispose();
+    updateInfo(`Vzorek pro třídu "${classId}" úspěšně přidán. Aktuální počet tříd: ${classifier.getNumClasses()}.`);
+  }
+
+  async function loadReferenceImage(file) {
+    updateInfo("Načítám referenční fotku...");
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = async function (e) {
+        const img = new Image();
+        img.onload = async () => {
+          drawReferenceImage(img);
+          const tempCanvas = document.createElement('canvas');
+          tempCanvas.width = img.width;
+          tempCanvas.height = img.height;
+          const tempCtx = tempCanvas.getContext('2d');
+          tempCtx.drawImage(img, 0, 0);
+          const imgTensor = tf.browser.fromPixels(tempCanvas);
+          referenceEmbedding = mobileNetModel.infer(imgTensor, true);
+          imgTensor.dispose();
+          updateInfo("Referenční fotka načtena a zpracována.");
+          resolve();
+        };
+        img.src = e.target.result;
+      };
+      reader.onerror = () => {
+        const errorMsg = 'Nepodařilo se načíst obrázek.';
+        updateInfo(errorMsg);
+        reject(new Error(errorMsg));
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function clearReference() {
+    referencePreview.innerHTML = '';
+    if (referenceEmbedding) referenceEmbedding.dispose();
+    referenceEmbedding = null;
+    updateInfo("Reference vymazána.");
+  }
+
+  function startRecording() {
+    if (!videoStream) {
+      updateInfo("Nelze začít nahrávání, kamera není aktivní.");
+      return;
+    }
+    updateInfo("Spouštím nahrávání...");
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(videoStream, { mimeType: 'video/webm; codecs=vp9' });
+    mediaRecorder.ondataavailable = e => {
+      if (e.data.size > 0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.onstop = () => {
+      updateInfo(`Nahrávání dokončeno. Celkem zaznamenáno ${recordedChunks.length} datových bloků.`);
+      exportMp4Btn.disabled = false;
+    };
+    mediaRecorder.start();
+    updateInfo("Nahrávání spuštěno.");
+    startRecBtn.disabled = true;
+    stopRecBtn.disabled = false;
+    exportMp4Btn.disabled = true;
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      updateInfo("Zastavuji nahrávání...");
+      mediaRecorder.stop();
+      startRecBtn.disabled = false;
+      stopRecBtn.disabled = true;
+    }
+  }
+
+  async function exportMp4() {
+    updateInfo("Probíhá převod WebM na MP4, čekejte prosím. Může to trvat několik desítek sekund...");
+    try {
+        const ffmpeg = FFmpeg.createFFmpeg({ log: true });
+        await ffmpeg.load();
+        const webmBlob = new Blob(recordedChunks, { type: 'video/webm' });
+        const arrayBuffer = await webmBlob.arrayBuffer();
+        ffmpeg.FS('writeFile', 'input.webm', new Uint8Array(arrayBuffer));
+        await ffmpeg.run('-i', 'input.webm', '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', 'output.mp4');
+        const data = ffmpeg.FS('readFile', 'output.mp4');
+        const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
+        const url = URL.createObjectURL(mp4Blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'recording.mp4';
+        a.click();
+        URL.revokeObjectURL(url);
+        updateInfo("Export do MP4 dokončen. Soubor je ke stažení.");
+    } catch(e) {
+        updateInfo("Chyba při exportu: " + e.message);
+        console.error(e);
+    }
+  }
+
+  function renderClassButtons() {
+    classButtonsDiv.innerHTML = '';
+    const classes = classifier.getClassLabels();
+    classes.forEach(cls => {
+      const btn = document.createElement('button');
+      btn.textContent = cls;
+      btn.className = 'class-label';
+      btn.onclick = () => addExample(cls);
+      classButtonsDiv.appendChild(btn);
+    });
+  }
+
+  function addNewClass() {
+    const newClass = newClassNameInput.value.trim();
+    if (!newClass) {
+      updateInfo("Nelze přidat třídu. Zadejte její název.");
+      return;
+    }
+    if (classifier.getClassLabels().includes(newClass)) {
+      updateInfo("Třída s tímto názvem již existuje.");
+      return;
+    }
+    updateInfo(`Přidána nová třída: "${newClass}".`);
+    renderClassButtons();
+    newClassNameInput.value = '';
+  }
+
+  async function detectFrame() {
+    if (!model || !video.srcObject) {
+      requestAnimationFrame(detectFrame);
+      return;
+    }
+    try {
+      predictions = await model.detect(video);
+      if (classifier.getNumClasses() > 0 && mobileNetModel) {
+        for (let i = 0; i < predictions.length; i++) {
+          const box = predictions[i].bbox;
+          const [x, y, w, h] = box;
+          const tempCanvas = document.createElement('canvas');
+          tempCanvas.width = w;
+          tempCanvas.height = h;
+          const tempCtx = tempCanvas.getContext('2d');
+          tempCtx.drawImage(video, x, y, w, h, 0, 0, w, h);
+          const imgTensor = tf.browser.fromPixels(tempCanvas);
+          const embedding = mobileNetModel.infer(imgTensor, true);
+          if (classifier.getNumClasses() > 0) {
+            const result = await classifier.predictClass(embedding);
+            if (result.confidences) {
+              const maxClass = Object.keys(result.confidences).reduce((a, b) =>
+                result.confidences[a] > result.confidences[b] ? a : b);
+              predictions[i].class = maxClass;
+              predictions[i].score = result.confidences[maxClass];
+            }
+          }
+          imgTensor.dispose();
+          embedding.dispose();
+        }
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (selectedIndex >= 0 && selectedIndex < predictions.length) {
+        const box = predictions[selectedIndex].bbox;
+        switch (zoomMode) {
+          case 'automatický':
+            zoomToBox(box);
+            break;
+          case 'adaptivní':
+            let targetZoom = Math.min(5, zoomBoxScale * (canvas.width / box[2]));
+            smoothedZoom = adaptiveZoom(smoothedZoom, targetZoom, adaptiveSpeed);
+            manualZoom = smoothedZoom;
+            manualZoomValue.textContent = manualZoom.toFixed(2);
+            zoomToBox(box);
+            break;
+          case 'manuální':
+            zoomToBox(box);
+            break;
+        }
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+      drawBoundingBoxes(predictions);
+      requestAnimationFrame(detectFrame);
+    } catch (e) {
+      console.error(e);
+      updateInfo("Kritická chyba při detekci: " + e.message + ". Zastavuji smyčku.");
+    }
+  }
+
+  // --- Eventy ---
+  switchCameraBtn.onclick = async () => {
+    updateInfo("Přepínám kameru...");
+    usingFrontCamera = !usingFrontCamera;
+    await setupCamera();
+  };
+  videoQualitySelect.onchange = async () => {
+    updateInfo("Měním kvalitu videa...");
+    await setupCamera();
+  };
+  prevBtn.onclick = () => {
+    selectPrevObject();
+  };
+  nextBtn.onclick = () => {
+    selectNextObject();
+  };
+  toggleZoomBtn.onclick = () => {
+    toggleZoomMode();
+  };
+  manualZoomSlider.oninput = () => {
+    manualZoom = parseFloat(manualZoomSlider.value);
+    manualZoomValue.textContent = manualZoom.toFixed(2);
+  };
+  zoomBoxScaleSlider.oninput = () => {
+    zoomBoxScale = parseFloat(zoomBoxScaleSlider.value);
+    zoomBoxScaleValue.textContent = zoomBoxScale.toFixed(2);
+  };
+  adaptiveSpeedSlider.oninput = () => {
+    adaptiveSpeed = parseFloat(adaptiveSpeedSlider.value);
+    adaptiveSpeedValue.textContent = adaptiveSpeed.toFixed(2);
+  };
+  loadReferenceBtn.onclick = () => {
+    referenceImageInput.click();
+  };
+  referenceImageInput.onchange = async (e) => {
+    if (e.target.files.length > 0) {
+      await loadReferenceImage(e.target.files[0]);
+    }
+  };
+  clearReferenceBtn.onclick = () => {
+    clearReference();
+  };
+  startRecBtn.onclick = () => {
+    startRecording();
+  };
+  stopRecBtn.onclick = () => {
+    stopRecording();
+  };
+  exportMp4Btn.onclick = () => {
+    exportMp4();
+  };
+  addClassBtn.onclick = () => {
+    addNewClass();
+  };
+
+  // --- Inicializace ---
+  updateInfo("Aplikace se spouští. Inicializuji...");
+  await setupCamera();
+  await loadModels();
+  renderClassButtons();
+  updateInfo("Vše připraveno, začínám detekci. Prosím, sledujte obraz.");
+  detectFrame();
+
+})();
+</script>
+
+</body>
+</html>
